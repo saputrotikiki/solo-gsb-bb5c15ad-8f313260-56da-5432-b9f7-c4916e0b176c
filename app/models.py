@@ -221,3 +221,35 @@ class StaffingGapsResponse(BaseModel):
     gaps: list[StaffingGapOut] = Field(
         ..., description="人数不足的非空区间，按起点排序；达标时为空列表"
     )
+
+
+class RestViolationsRequest(BaseModel):
+    """同一员工的休息违规检查：一组单侧日程 + 最低休息分钟数。"""
+
+    min_rest_minutes: int = Field(..., ge=1, description="最低休息分钟数，>= 1")
+    schedules: list[OverlapSide] = Field(
+        ...,
+        min_length=1,
+        description="同一员工的日程列表（与 /overlaps 单侧相同），至少 1 条",
+    )
+
+
+class RestViolationOut(BaseModel):
+    start_utc: str = Field(
+        ..., description="休息空档起点（前一段工作终点，含），UTC，Z 结尾"
+    )
+    end_utc: str = Field(
+        ..., description="休息空档终点（后一段工作起点，不含），UTC，Z 结尾"
+    )
+    rest_minutes: float = Field(..., description="实际休息分钟数（真实 UTC 流逝）")
+    shortfall_minutes: float = Field(
+        ..., description="低于阈值的差额（min_rest_minutes - rest_minutes）"
+    )
+
+
+class RestViolationsResponse(BaseModel):
+    min_rest_minutes: int = Field(..., description="本次检查使用的最低休息分钟数")
+    count: int = Field(..., description="休息不足的空档数")
+    violations: list[RestViolationOut] = Field(
+        ..., description="低于阈值的休息空档，按 start_utc 排序；无违规时为空列表"
+    )

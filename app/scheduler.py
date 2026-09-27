@@ -289,6 +289,46 @@ def staffing_gaps(
     return merged
 
 
+@dataclass(frozen=True)
+class RestViolation:
+    """一段低于最低休息时长的空档：UTC 起止、实际休息分钟与差额分钟。"""
+
+    start: datetime
+    end: datetime
+    rest_minutes: float
+    shortfall_minutes: float
+
+
+def rest_violations(
+    *,
+    intervals: Iterable[tuple[datetime, datetime]],
+    min_rest_minutes: int,
+) -> list[RestViolation]:
+    """找出相邻工作段之间低于最低休息时长的空档。
+
+    半开 UTC 工作区间先按真实时间合并（相交或相接者并段，连续工作不会
+    产生零或负休息），再仅比较相邻工作段之间的空档；空档按真实 UTC 流逝
+    计（跨时区与夏令时切换均不影响），低于 min_rest_minutes 的输出为违规，
+    结果按起点排序。
+    """
+    merged = merge_intervals(intervals)
+    threshold = timedelta(minutes=min_rest_minutes)
+    violations: list[RestViolation] = []
+    for (_, prev_end), (next_start, _) in zip(merged, merged[1:]):
+        gap = next_start - prev_end  # 合并保证相邻段不相接：gap > 0
+        if gap < threshold:
+            rest = gap.total_seconds() / 60
+            violations.append(
+                RestViolation(
+                    start=prev_end,
+                    end=next_start,
+                    rest_minutes=rest,
+                    shortfall_minutes=min_rest_minutes - rest,
+                )
+            )
+    return violations
+
+
 def utc_iso(dt: datetime) -> str:
     """把 UTC 时刻格式化为 Z 结尾的 ISO 8601 字符串。"""
     return dt.isoformat().replace("+00:00", "Z")
