@@ -5,12 +5,14 @@ from zoneinfo import ZoneInfo
 
 from app.scheduler import (
     Instance,
+    RestViolation,
     StaffingGap,
     classify,
     expand_schedule,
     find_overlaps,
     merge_intervals,
     occupancy_by_day,
+    rest_violations,
     staffing_gaps,
 )
 
@@ -420,3 +422,74 @@ def test_staffing_gaps_ignores_intervals_outside_window():
         employee_intervals={"alice": [(_utc(3, 0), _utc(3, 1))]},
     )
     assert gaps == [StaffingGap(_utc(1, 0), _utc(2, 0), (), 1)]
+
+
+# --- rest_violations --------------------------------------------------------
+
+
+def test_rest_violations_basic():
+    # 工作段 [08:00,09:00) 与 [10:00,11:00)，空档 60 分钟 < 阈值 90
+    violations = rest_violations(
+        intervals=[(_utc(1, 8), _utc(1, 9)), (_utc(1, 10), _utc(1, 11))],
+        min_rest_minutes=90,
+    )
+    assert violations == [RestViolation(_utc(1, 9), _utc(1, 10))]
+    assert violations[0].rest_minutes == 60
+
+
+def test_rest_violations_touching_intervals_merged_no_violation():
+    # 相接区间合并为连续工作 [08:00,10:00)，不产生空档（无零/负休息）
+    assert (
+        rest_violations(
+            intervals=[(_utc(1, 8), _utc(1, 9)), (_utc(1, 9), _utc(1, 10))],
+            min_rest_minutes=90,
+        )
+        == []
+    )
+    # 相交区间同样合并
+    assert (
+        rest_violations(
+            intervals=[(_utc(1, 8), _utc(1, 9, 30)), (_utc(1, 9), _utc(1, 10))],
+            min_rest_minutes=1,
+        )
+        == []
+    )
+
+
+def test_rest_violations_exact_threshold_not_violation():
+    # 空档恰好等于阈值，不算低于阈值
+    assert (
+        rest_violations(
+            intervals=[(_utc(1, 8), _utc(1, 9)), (_utc(1, 10), _utc(1, 11))],
+            min_rest_minutes=60,
+        )
+        == []
+    )
+
+
+def test_rest_violations_sorted_multiple():
+    # 三段工作产生两个违规空档，按起点排序
+    violations = rest_violations(
+        intervals=[
+            (_utc(1, 8), _utc(1, 9)),
+            (_utc(1, 9, 30), _utc(1, 10)),
+            (_utc(1, 10, 45), _utc(1, 12)),
+        ],
+        min_rest_minutes=60,
+    )
+    assert violations == [
+        RestViolation(_utc(1, 9), _utc(1, 9, 30)),
+        RestViolation(_utc(1, 10), _utc(1, 10, 45)),
+    ]
+    assert [v.rest_minutes for v in violations] == [30, 45]
+
+
+def test_rest_violations_unsorted_input_and_single_segment():
+    # 输入无需有序；不足两段工作无空档可比
+    violations = rest_violations(
+        intervals=[(_utc(1, 10), _utc(1, 11)), (_utc(1, 8), _utc(1, 9))],
+        min_rest_minutes=200,
+    )
+    assert violations == [RestViolation(_utc(1, 9), _utc(1, 10))]
+    assert rest_violations(intervals=[(_utc(1, 8), _utc(1, 9))], min_rest_minutes=1) == []
+    assert rest_violations(intervals=[], min_rest_minutes=1) == []

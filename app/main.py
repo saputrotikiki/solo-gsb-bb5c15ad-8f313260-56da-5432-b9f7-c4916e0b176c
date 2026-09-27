@@ -14,6 +14,9 @@ from .models import (
     ExpandResponse,
     OverlapRequest,
     OverlapResponse,
+    RestViolationOut,
+    RestViolationsRequest,
+    RestViolationsResponse,
     StaffingGapOut,
     StaffingGapsRequest,
     StaffingGapsResponse,
@@ -23,6 +26,7 @@ from .scheduler import (
     find_overlaps,
     instance_payload,
     occupancy_by_day,
+    rest_violations,
     staffing_gaps,
     utc_iso,
 )
@@ -35,7 +39,8 @@ app = FastAPI(
         "通过 UTC 往返校验区分正常 / 跳时 / 叠时，"
         "按策略生成去重且按 UTC 稳定排序的实例，"
         "并可检测两个日程在真实时间轴上的重叠、按报告时区统计逐日占用，"
-        "以及按 UTC 窗口扫描多员工在岗人数缺口。"
+        "按 UTC 窗口扫描多员工在岗人数缺口，"
+        "以及检查同一员工相邻工作段之间的休息是否低于最低分钟数。"
     ),
 )
 
@@ -171,5 +176,44 @@ def staffing_gaps_check(req: StaffingGapsRequest) -> StaffingGapsResponse:
                 missing=g.missing,
             )
             for g in gaps
+        ],
+    )
+
+
+@app.post(
+    "/rest-violations",
+    response_model=RestViolationsResponse,
+    summary="检查相邻工作段间休息不足的空档",
+)
+def rest_violations_check(req: RestViolationsRequest) -> RestViolationsResponse:
+    # 同一员工的各条日程按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间
+    intervals: list[tuple[datetime, datetime]] = []
+    for side in req.schedules:
+        tz = ZoneInfo(side.timezone)
+        instances, _ = expand_schedule(
+            tz=tz,
+            start_date=side.start_date,
+            end_date=side.end_date,
+            weekdays=side.weekdays,
+            local_time=side.local_time,
+            gap_strategy=side.gap_strategy.value,
+            fold_strategy=side.fold_strategy.value,
+        )
+        span = timedelta(minutes=side.duration_minutes)
+        intervals.extend((i.utc, i.utc + span) for i in instances)
+    violations = rest_violations(
+        intervals=intervals, min_rest_minutes=req.min_rest_minutes
+    )
+    return RestViolationsResponse(
+        min_rest_minutes=req.min_rest_minutes,
+        count=len(violations),
+        violations=[
+            RestViolationOut(
+                start_utc=utc_iso(v.start),
+                end_utc=utc_iso(v.end),
+                rest_minutes=v.rest_minutes,
+                shortfall_minutes=req.min_rest_minutes - v.rest_minutes,
+            )
+            for v in violations
         ],
     )

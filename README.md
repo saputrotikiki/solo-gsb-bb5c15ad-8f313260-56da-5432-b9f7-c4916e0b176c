@@ -7,7 +7,9 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 用**扫描线**检测它们在真实时间轴上的全部冲突；`POST /daily-occupancy`
 则把单侧日程的占用区间合并后按**报告时区的本地日界**切分，逐日统计真实占用分钟数；
 `POST /staffing-gaps` 在 UTC 窗口内扫描多名员工的上下岗事件，
-输出在岗人数低于最低要求的缺员区间。
+输出在岗人数低于最低要求的缺员区间；`POST /rest-violations`
+把同一员工的多条日程在真实 UTC 时间轴上合并为工作段，
+检查相邻工作段之间的休息空档是否低于最低分钟数。
 
 ## 快速启动（单条命令）
 
@@ -20,7 +22,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`
 
 ## 配置
 
@@ -280,6 +282,80 @@ docker compose up --build
 | `gaps[].on_duty` | 区间内在岗员工 ID，升序（可能为空列表） |
 | `gaps[].missing` | 缺少人数（`min_staff` − 在岗人数） |
 
+### `POST /rest-violations`
+
+检查同一员工相邻工作段之间的休息是否低于最低分钟数。请求体携带该员工的
+**一组日程**（`schedules`，与 `/overlaps` 单侧参数与校验完全一致，各含
+`duration_minutes`）与 `min_rest_minutes`。各日程按既有跳时 / 叠时策略展开后，
+实例按真实时长解释为**半开 UTC 区间** `[start, start+duration)`，并在真实 UTC
+时间轴上**合并所有相交或相接的工作区间**（连续工作合并为一段，不产生空档，
+故休息时长恒为正、不会出现负休息）。随后**仅比较相邻工作段之间的空档**，
+返回严格低于阈值的空档：起止 UTC、实际休息分钟与差额，按起点排序。
+跨时区与夏令时切换均按真实经过时间计算（如春跳当日钟面 3 小时仅为真实 2 小时）。
+
+请求体：
+
+```json
+{
+  "schedules": [
+    {
+      "timezone": "Europe/Berlin",
+      "start_date": "2026-03-02",
+      "end_date": "2026-03-02",
+      "weekdays": [0],
+      "local_time": "09:00",
+      "duration_minutes": 240
+    },
+    {
+      "timezone": "America/New_York",
+      "start_date": "2026-03-02",
+      "end_date": "2026-03-02",
+      "weekdays": [0],
+      "local_time": "08:00",
+      "duration_minutes": 60
+    }
+  ],
+  "min_rest_minutes": 90
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `schedules` | object[] | 日程列表（与 `/overlaps` 单侧相同），至少 1 条 |
+| `min_rest_minutes` | int | 相邻工作段之间的最低休息分钟数，`>= 1` |
+
+响应 `200`（`violations` 按 `start_utc` 排序）：
+
+```json
+{
+  "min_rest_minutes": 90,
+  "count": 1,
+  "violations": [
+    {
+      "start_utc": "2026-03-02T12:00:00Z",
+      "end_utc": "2026-03-02T13:00:00Z",
+      "rest_minutes": 60.0,
+      "shortfall_minutes": 30.0
+    }
+  ]
+}
+```
+
+上例中柏林 09:00 CET = 08:00 UTC 工作 240 分钟（至 12:00 UTC），
+纽约 08:00 EST = 13:00 UTC 工作 60 分钟；两段之间真实空档
+`[12:00, 13:00)` UTC 仅 60 分钟，低于阈值 90，差额 30 分钟。
+
+| 字段 | 说明 |
+| --- | --- |
+| `min_rest_minutes` | 最低休息分钟数阈值 |
+| `count` | 休息不足的空档数 |
+| `violations[].start_utc` / `violations[].end_utc` | 空档起止（半开：起点为上一工作段终点，终点为下一工作段起点），UTC，Z 结尾 |
+| `violations[].rest_minutes` | 实际休息分钟数（真实 UTC 流逝） |
+| `violations[].shortfall_minutes` | 休息差额（`min_rest_minutes` − `rest_minutes`） |
+
+空档恰好等于阈值不算违规；所有空档均达标（或工作段不足两段）时
+`violations` 为空列表。
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -291,6 +367,8 @@ docker compose up --build
 - 星期值越界（不在 0–6）或集合为空等其他字段校验失败
 - `/staffing-gaps`：窗口起止不是以 `Z` 结尾的 UTC 时刻、窗口未递增或超过 366 天、
   `min_staff` 不在 1～员工总数、员工数不在 1～20、员工 ID 重复
+- `/rest-violations`：`schedules` 为空、`min_rest_minutes` 小于 1，
+  或任一日程字段校验失败（规则与 `/overlaps` 单侧一致）
 
 ## 判定原理
 
@@ -312,9 +390,9 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

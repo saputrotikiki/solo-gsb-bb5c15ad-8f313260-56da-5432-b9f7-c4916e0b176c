@@ -948,3 +948,331 @@ def test_staffing_gaps_reuses_schedule_validation():
         ),
     )
     assert resp.status_code == 422
+
+
+# --- POST /rest-violations ---------------------------------------------------
+
+
+def _rest_schedule(local_time: str, duration: int = 60, **overrides) -> dict:
+    schedule = {
+        "timezone": "UTC",
+        "start_date": "2026-03-02",
+        "end_date": "2026-03-02",
+        "weekdays": [0],
+        "local_time": local_time,
+        "duration_minutes": duration,
+    }
+    schedule.update(overrides)
+    return schedule
+
+
+def test_rest_violations_basic():
+    # 工作段 [08:00,09:00) 与 [10:00,11:00) UTC，空档 60 分钟 < 阈值 90
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [_rest_schedule("08:00"), _rest_schedule("10:00")],
+            "min_rest_minutes": 90,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "min_rest_minutes": 90,
+        "count": 1,
+        "violations": [
+            {
+                "start_utc": "2026-03-02T09:00:00Z",
+                "end_utc": "2026-03-02T10:00:00Z",
+                "rest_minutes": 60.0,
+                "shortfall_minutes": 30.0,
+            }
+        ],
+    }
+
+
+def test_rest_violations_touching_schedules_merged_no_violation():
+    # 相接日程 08:00+60 / 09:00+60 合并为连续工作，不产生空档（无负休息）
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [_rest_schedule("08:00"), _rest_schedule("09:00")],
+            "min_rest_minutes": 90,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"min_rest_minutes": 90, "count": 0, "violations": []}
+
+
+def test_rest_violations_exact_threshold_not_violation():
+    # 空档恰好 90 分钟，等于阈值不算违规
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [_rest_schedule("08:00"), _rest_schedule("10:30")],
+            "min_rest_minutes": 90,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+
+
+def test_rest_violations_sorted_multiple():
+    # 三段工作 08:00+60 / 09:30+30 / 10:45+60，两个空档 30 / 45 分钟，按起点排序
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [
+                _rest_schedule("10:45"),
+                _rest_schedule("08:00"),
+                _rest_schedule("09:30", 30),
+            ],
+            "min_rest_minutes": 60,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 2
+    assert body["violations"] == [
+        {
+            "start_utc": "2026-03-02T09:00:00Z",
+            "end_utc": "2026-03-02T09:30:00Z",
+            "rest_minutes": 30.0,
+            "shortfall_minutes": 30.0,
+        },
+        {
+            "start_utc": "2026-03-02T10:00:00Z",
+            "end_utc": "2026-03-02T10:45:00Z",
+            "rest_minutes": 45.0,
+            "shortfall_minutes": 15.0,
+        },
+    ]
+
+
+def test_rest_violations_cross_timezone():
+    # 柏林 09:00 CET = 08:00 UTC 工作 60 分钟；
+    # 纽约 04:30 EST = 09:30 UTC 工作 60 分钟 -> 空档 [09:00, 09:30) 30 分钟
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [
+                _rest_schedule("09:00", timezone="Europe/Berlin"),
+                _rest_schedule("04:30", timezone="America/New_York"),
+            ],
+            "min_rest_minutes": 45,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["violations"] == [
+        {
+            "start_utc": "2026-03-02T09:00:00Z",
+            "end_utc": "2026-03-02T09:30:00Z",
+            "rest_minutes": 30.0,
+            "shortfall_minutes": 15.0,
+        }
+    ]
+
+
+def test_rest_violations_spring_forward_real_elapsed():
+    # 纽约 2026-03-08 春跳（02:00 -> 03:00）：
+    # 01:00 EST = 06:00 UTC 工作 60 分钟，04:00 EDT = 08:00 UTC 工作 60 分钟；
+    # 钟面相隔 3 小时，真实空档仅 [07:00, 08:00) = 60 分钟
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [
+                _rest_schedule(
+                    "01:00",
+                    timezone="America/New_York",
+                    start_date="2026-03-08",
+                    end_date="2026-03-08",
+                    weekdays=[6],
+                ),
+                _rest_schedule(
+                    "04:00",
+                    timezone="America/New_York",
+                    start_date="2026-03-08",
+                    end_date="2026-03-08",
+                    weekdays=[6],
+                ),
+            ],
+            "min_rest_minutes": 90,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["violations"] == [
+        {
+            "start_utc": "2026-03-08T07:00:00Z",
+            "end_utc": "2026-03-08T08:00:00Z",
+            "rest_minutes": 60.0,
+            "shortfall_minutes": 30.0,
+        }
+    ]
+
+
+def test_rest_violations_fall_back_real_elapsed():
+    # 纽约 2026-11-01 秋回（当日 25 小时）：
+    # 00:30 EDT = 04:30 UTC 工作 60 分钟，03:00 EST = 08:00 UTC 工作 60 分钟；
+    # 真实空档 [05:30, 08:00) = 150 分钟（钟面仅 1.5 小时）
+    schedules = [
+        _rest_schedule(
+            "00:30",
+            timezone="America/New_York",
+            start_date="2026-11-01",
+            end_date="2026-11-01",
+            weekdays=[6],
+        ),
+        _rest_schedule(
+            "03:00",
+            timezone="America/New_York",
+            start_date="2026-11-01",
+            end_date="2026-11-01",
+            weekdays=[6],
+        ),
+    ]
+    resp = client.post(
+        "/rest-violations", json={"schedules": schedules, "min_rest_minutes": 120}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0  # 150 >= 120，达标
+
+    resp = client.post(
+        "/rest-violations", json={"schedules": schedules, "min_rest_minutes": 180}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["violations"] == [
+        {
+            "start_utc": "2026-11-01T05:30:00Z",
+            "end_utc": "2026-11-01T08:00:00Z",
+            "rest_minutes": 150.0,
+            "shortfall_minutes": 30.0,
+        }
+    ]
+
+
+def test_rest_violations_fold_both_touching_no_violation():
+    # 纽约 2026-11-01 01:30 出现两次（05:30 / 06:30 UTC），各 60 分钟且相接
+    # -> 合并为连续工作 [05:30, 07:30)，无空档、无负休息
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [
+                _rest_schedule(
+                    "01:30",
+                    timezone="America/New_York",
+                    start_date="2026-11-01",
+                    end_date="2026-11-01",
+                    weekdays=[6],
+                    fold_strategy="both",
+                )
+            ],
+            "min_rest_minutes": 60,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"min_rest_minutes": 60, "count": 0, "violations": []}
+
+
+def test_rest_violations_gap_shift_forward():
+    # 纽约 2026-03-08 02:30 不存在；shift_forward 后 03:30 EDT = 07:30 UTC
+    # 工作段 [07:30, 08:30) 与 09:00 UTC 起的另一段，空档 30 分钟
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [
+                _rest_schedule(
+                    "02:30",
+                    timezone="America/New_York",
+                    start_date="2026-03-08",
+                    end_date="2026-03-08",
+                    weekdays=[6],
+                    gap_strategy="shift_forward",
+                ),
+                _rest_schedule(
+                    "09:00",
+                    timezone="UTC",
+                    start_date="2026-03-08",
+                    end_date="2026-03-08",
+                    weekdays=[6],
+                ),
+            ],
+            "min_rest_minutes": 45,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["violations"] == [
+        {
+            "start_utc": "2026-03-08T08:30:00Z",
+            "end_utc": "2026-03-08T09:00:00Z",
+            "rest_minutes": 30.0,
+            "shortfall_minutes": 15.0,
+        }
+    ]
+
+
+def test_rest_violations_all_skipped_empty():
+    # 唯一日程被 skip 策略跳过 -> 无工作段，无违规
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [
+                _rest_schedule(
+                    "02:30",
+                    timezone="America/New_York",
+                    start_date="2026-03-08",
+                    end_date="2026-03-08",
+                    weekdays=[6],
+                    gap_strategy="skip",
+                )
+            ],
+            "min_rest_minutes": 60,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"min_rest_minutes": 60, "count": 0, "violations": []}
+
+
+def test_rest_violations_min_rest_bounds_422():
+    payload = {"schedules": [_rest_schedule("08:00")], "min_rest_minutes": 0}
+    resp = client.post("/rest-violations", json=payload)
+    assert resp.status_code == 422
+
+
+def test_rest_violations_empty_schedules_422():
+    resp = client.post(
+        "/rest-violations", json={"schedules": [], "min_rest_minutes": 60}
+    )
+    assert resp.status_code == 422
+
+
+def test_rest_violations_reuses_schedule_validation():
+    # 日程沿用 /overlaps 单侧校验：非法时区 / 时长越界 / 区间超 366 天均 422
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [_rest_schedule("08:00", timezone="Not/AZone")],
+            "min_rest_minutes": 60,
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [_rest_schedule("08:00", 0)],
+            "min_rest_minutes": 60,
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/rest-violations",
+        json={
+            "schedules": [
+                _rest_schedule(
+                    "08:00", start_date="2026-01-01", end_date="2027-01-03"
+                )
+            ],
+            "min_rest_minutes": 60,
+        },
+    )
+    assert resp.status_code == 422

@@ -220,6 +220,42 @@ def occupancy_by_day(
 
 
 @dataclass(frozen=True)
+class RestViolation:
+    """一段低于最低休息要求的空档：空档起止（均为 UTC）。
+
+    start 为上一工作段终点（含），end 为下一工作段起点（不含）。
+    """
+
+    start: datetime
+    end: datetime
+
+    @property
+    def rest_minutes(self) -> float:
+        """实际休息时长（分钟，按真实 UTC 流逝）。"""
+        return (self.end - self.start).total_seconds() / 60
+
+
+def rest_violations(
+    *,
+    intervals: Iterable[tuple[datetime, datetime]],
+    min_rest_minutes: int,
+) -> list[RestViolation]:
+    """枚举相邻工作段之间低于最低休息分钟的空档。
+
+    所有半开工作区间先按真实 UTC 时间轴合并（相交或相接者并成一段，
+    连续工作不产生空档，故休息时长恒为正）；再逐对比较相邻工作段，
+    仅空档严格小于阈值时记为违规。返回按空档起点排序的结果。
+    """
+    merged = merge_intervals(intervals)
+    threshold = timedelta(minutes=min_rest_minutes)
+    violations: list[RestViolation] = []
+    for (_, prev_end), (next_start, _) in zip(merged, merged[1:]):
+        if next_start - prev_end < threshold:
+            violations.append(RestViolation(prev_end, next_start))
+    return violations
+
+
+@dataclass(frozen=True)
 class StaffingGap:
     """一段人数不足的区间：UTC 起止、在岗员工 ID（升序）与缺少人数。"""
 
